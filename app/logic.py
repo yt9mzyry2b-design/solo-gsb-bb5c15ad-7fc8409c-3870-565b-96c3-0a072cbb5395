@@ -10,9 +10,10 @@
 import hashlib
 import json
 import sqlite3
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
-from .schemas import IngestResponse, PackageIn
+from .schemas import IngestResponse, PackageIn, RollupResponse, RollupWindow
 
 
 class IdempotencyConflict(Exception):
@@ -159,3 +160,121 @@ def ingest_package(conn: sqlite3.Connection, pkg: PackageIn, key: str) -> Ingest
     )
     _store_key(conn, key, pkg, payload_hash, response)
     return response
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """naive 时间视为 UTC；带时区的时间统一换算到 UTC。"""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_sent_at(value: Optional[str]) -> Optional[datetime]:
+    """解析 canonical payload 中 isoformat 写出的 sent_at（兼容 Z 后缀）。"""
+    if not value:
+        return None
+    dt = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    return _as_utc(dt)
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _window_index(event_time: datetime, window_seconds: int) -> int:
+    """epoch 对齐窗口下标：floor(event_time / window)，整数微秒精度运算。"""
+    delta = event_time - _EPOCH
+    epoch_seconds = delta.days * 86400 + delta.seconds
+    return epoch_seconds // window_seconds
+
+
+def rollup_metrics(
+    conn: sqlite3.Connection,
+    device_id: str,
+    metric: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    window_seconds: int,
+    allowed_lateness: int,
+) -> RollupResponse:
+    """按 sent_at 事件时间对已提交测量做半开窗口聚合。
+
+    - 窗口为 epoch 对齐的半开区间 [window_start, window_end)；
+    - 水位 watermark = 该设备已提交包的最大 sent_at − allowed_lateness；
+    - 已提交数据按提交顺序（seq 升序，即对外可见的到达顺序）回放：
+      某样本到达前，若 watermark 已达到其所属窗口的 window_end，则该窗口
+      已经"关闭"，样本计入 late_count 但绝不改写该窗口的结果；
+    - 仅统计 metric 匹配、sent_at 落在查询区间 [from, to) 内的测量；
+      仅返回至少含一个准时样本的窗口，按 window_start 稳定升序。
+    """
+    from_dt = _as_utc(from_dt)
+    to_dt = _as_utc(to_dt)
+    window = timedelta(seconds=window_seconds)
+    lateness = timedelta(seconds=allowed_lateness)
+
+    rows = conn.execute(
+        "SELECT seq, payload_json FROM committed WHERE device_id = ? ORDER BY seq",
+        (device_id,),
+    ).fetchall()
+
+    # 窗口聚合状态；一旦样本到达时窗口已关闭，状态即被冻结、不再变动
+    accum: Dict[int, Dict[str, float]] = {}
+    late_count = 0
+    max_seen: Optional[datetime] = None
+
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        event_time = _parse_sent_at(payload.get("sent_at"))
+        if event_time is None:
+            # 没有事件时间的包无法参与事件时间聚合
+            continue
+        # 最大 sent_at 基于设备收到的全部已提交数据，与查询区间 / 指标无关
+        max_seen = event_time if max_seen is None or event_time > max_seen else max_seen
+        if event_time < from_dt or event_time >= to_dt:
+            continue
+        for measurement in payload.get("measurements", []):
+            if measurement.get("metric") != metric:
+                continue
+            idx = _window_index(event_time, window_seconds)
+            window_end = _EPOCH + (idx + 1) * window
+            # 先判定：以到达前水位衡量窗口是否已关闭，再据此接纳或计迟到
+            if window_end <= max_seen - lateness:
+                late_count += 1
+                continue
+            value = float(measurement["value"])
+            acc = accum.get(idx)
+            if acc is None:
+                accum[idx] = {"count": 1.0, "min": value, "max": value, "sum": value}
+            else:
+                acc["count"] += 1
+                acc["sum"] += value
+                if value < acc["min"]:
+                    acc["min"] = value
+                if value > acc["max"]:
+                    acc["max"] = value
+
+    windows: List[RollupWindow] = []
+    for idx in sorted(accum):
+        acc = accum[idx]
+        start = _EPOCH + idx * window
+        windows.append(
+            RollupWindow(
+                window_start=start,
+                window_end=start + window,
+                count=int(acc["count"]),
+                min=acc["min"],
+                max=acc["max"],
+                mean=acc["sum"] / acc["count"],
+            )
+        )
+
+    return RollupResponse(
+        device_id=device_id,
+        metric=metric,
+        **{"from": from_dt},
+        to=to_dt,
+        window_seconds=window_seconds,
+        allowed_lateness=allowed_lateness,
+        watermark=(max_seen - lateness) if max_seen is not None else None,
+        late_count=late_count,
+        windows=windows,
+    )

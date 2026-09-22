@@ -1,12 +1,13 @@
 """FastAPI 路由与应用入口。"""
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query
 
 from . import db
-from .logic import IdempotencyConflict, ingest_package
+from .logic import IdempotencyConflict, ingest_package, rollup_metrics
 from .schemas import (
     CommittedResponse,
     DeviceState,
@@ -15,6 +16,7 @@ from .schemas import (
     GapsResponse,
     IngestResponse,
     PackageIn,
+    RollupResponse,
 )
 
 
@@ -177,3 +179,25 @@ def get_duplicates(
         count=total,
         records=[DuplicateRecord(**dict(r)) for r in rows],
     )
+
+
+@app.get("/api/v1/devices/{device_id}/metrics/rollup", response_model=RollupResponse)
+def get_metrics_rollup(
+    device_id: str,
+    metric: str = Query(min_length=1, description="指标名，如 temperature"),
+    from_: datetime = Query(alias="from", description="查询起点（含），ISO 8601；naive 视为 UTC"),
+    to: datetime = Query(description="查询终点（不含），ISO 8601；naive 视为 UTC"),
+    window_seconds: int = Query(ge=1, description="滚动窗口长度（秒），按 epoch 对齐"),
+    allowed_lateness: int = Query(ge=0, description="允许迟到时长（秒）；watermark = max(sent_at) - 该值"),
+):
+    if from_ >= to:
+        raise HTTPException(status_code=422, detail="参数 from 必须早于 to")
+    with db.get_conn() as conn:
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"未知设备: {device_id}")
+        return rollup_metrics(
+            conn, device_id, metric, from_, to, window_seconds, allowed_lateness
+        )

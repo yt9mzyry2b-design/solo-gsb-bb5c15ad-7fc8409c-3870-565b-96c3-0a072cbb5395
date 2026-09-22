@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Measurement(BaseModel):
@@ -73,3 +73,36 @@ class DuplicatesResponse(BaseModel):
     device_id: str
     count: int
     records: List[DuplicateRecord]
+
+
+class RollupWindow(BaseModel):
+    """单个半开滚动窗口 [window_start, window_end) 的聚合结果。"""
+
+    window_start: datetime
+    window_end: datetime
+    count: int
+    min: float
+    max: float
+    mean: float
+
+
+class RollupResponse(BaseModel):
+    """按 sent_at 事件时间对已提交测量的窗口聚合。
+
+    已关闭窗口（watermark 越过其 window_end 时关闭）的结果不再被迟到样本改写；
+    迟到样本计入 late_count 但不参与任何窗口聚合。
+    """
+
+    device_id: str
+    metric: str
+    # 回显查询区间；from 是 Python 关键字，字段名用 from_ 并序列化为 "from"
+    model_config = ConfigDict(populate_by_name=True)
+    from_: datetime = Field(alias="from", serialization_alias="from")
+    to: datetime
+    window_seconds: int
+    allowed_lateness: int
+    watermark: Optional[datetime] = Field(
+        default=None, description="该设备已提交数据的最大 sent_at 减 allowed_lateness；无时间戳样本时为 null"
+    )
+    late_count: int = Field(description="落入已关闭窗口的迟到样本数（不参与聚合）")
+    windows: List[RollupWindow] = Field(description="按 window_start 稳定升序排列的窗口结果")
