@@ -1,15 +1,8 @@
-import os
-import tempfile
-
 import pytest
 
-# 在导入 app 之前指向临时数据库
-_tmpdir = tempfile.mkdtemp()
-os.environ["DB_PATH"] = os.path.join(_tmpdir, "test.db")
+from fastapi.testclient import TestClient
 
-from fastapi.testclient import TestClient  # noqa: E402
-
-from app.main import app  # noqa: E402
+from app.main import app
 
 
 @pytest.fixture()

@@ -4,11 +4,14 @@
 
 - **幂等去重**：每个包携带幂等键，重试 / 重发不会产生重复数据；
 - **乱序缓冲**：序号不连续的包先暂存，缺口补齐后**按序连续提交**；
-- **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录。
+- **可观测接口**：查询每台设备的缺口、已提交序号与重复包记录；
+- **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本。
 
 ## 快速开始
 
 ### Docker Compose（推荐）
+
+单条命令启动（构建镜像 + 安装依赖 + 建库 + 起服务）：
 
 ```bash
 docker compose up --build
@@ -21,9 +24,9 @@ docker compose up --build
 ### 本地开发
 
 ```bash
-pip install -r requirements-dev.txt
-uvicorn app.main:app --reload     # 数据库默认创建在 ./lab.db，可用 DB_PATH 覆盖
-pytest tests/                     # 运行测试
+pip install -r requirements-dev.txt   # 初始化依赖（含运行时与 pytest）
+uvicorn app.main:app --reload         # 数据库默认创建在 ./lab.db，可用 DB_PATH 覆盖
+pytest tests/                         # 运行测试
 ```
 
 ## 数据模型
@@ -70,6 +73,36 @@ pytest tests/                     # 运行测试
 | GET | `/api/v1/devices/{id}/gaps` | 缺口：缓冲区序号与缺失序号 |
 | GET | `/api/v1/devices/{id}/committed` | 已提交序号（支持 `from_seq`/`to_seq`/`limit`/`offset`） |
 | GET | `/api/v1/devices/{id}/duplicates` | 重复包记录（可按 `reason` 过滤） |
+| GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计） |
+
+## 窗口聚合（Rollup）
+
+`GET /api/v1/devices/{device_id}/metrics/rollup` 按**事件时间**（包的 `sent_at`）聚合**已提交**的测量：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `metric` | 是 | 指标名，只统计该指标的测量值 |
+| `from` / `to` | 是 | 聚合范围 `[from, to)`，ISO 8601（不带时区按 UTC 处理） |
+| `window_seconds` | 是 | 窗口宽度（秒），必须为正 |
+| `allowed_lateness` | 否 | 允许的迟到时长（秒），默认 `0` |
+
+语义：
+
+- 窗口是以 `from` 为锚点的**半开区间** `[from + k·w, from + (k+1)·w)`，覆盖 `[from, to)`；窗口按 `start` 升序稳定返回，空窗口 `count=0` 且统计值为 `null`；
+- **水位** `watermark = 设备已提交包的最大 sent_at - allowed_lateness`（设备级，与查询的指标、时间范围无关）；
+- 迟到判定发生在**包提交时刻**：按提交顺序重放，若某包的 `sent_at` 早于当时水位，其样本为迟到样本——计入 `late_count`，**不改写已关闭窗口**的统计；
+- 缓冲区中尚未提交的包不参与聚合；无 `sent_at` 的包无法分窗，跳过；
+- 单次查询窗口数上限 10000，超出返回 `422`（请增大 `window_seconds` 或缩小范围）。
+
+示例：
+
+```bash
+curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/rollup?metric=temperature&from=2026-09-22T08:00:00Z&to=2026-09-22T09:00:00Z&window_seconds=300&allowed_lateness=60'
+# => {"device_id":"ph-meter-01","metric":"temperature","from":"...","to":"...",
+#     "window_seconds":300.0,"allowed_lateness":60.0,
+#     "watermark":"2026-09-22T08:59:00Z","late_count":0,
+#     "windows":[{"start":"...","end":"...","count":3,"min":21.0,"max":21.6,"mean":21.3}, ...]}
+```
 
 ### 示例
 
@@ -116,9 +149,13 @@ curl localhost:8000/api/v1/devices/ph-meter-01/duplicates   # 重复包记录
 app/
   main.py     # FastAPI 路由
   logic.py    # 摄入核心：幂等判定、缓冲、排水提交
+  rollup.py   # 窗口聚合：半开窗口分桶、水位迟到判定
   db.py       # SQLite 连接与建表（启动时自动执行）
   schemas.py  # Pydantic 模型
-tests/test_api.py
+tests/
+  conftest.py     # 测试数据库隔离（临时文件）
+  test_api.py     # 摄入 / 查询接口测试
+  test_rollup.py  # 窗口聚合测试
 Dockerfile / docker-entrypoint.sh / docker-compose.yml
 requirements.txt / requirements-dev.txt
 ```

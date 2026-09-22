@@ -73,3 +73,35 @@ class DuplicatesResponse(BaseModel):
     device_id: str
     count: int
     records: List[DuplicateRecord]
+
+
+class RollupWindow(BaseModel):
+    """单个半开窗口 [start, end) 的聚合结果；空窗口 count=0 且统计值为 null。"""
+
+    start: datetime
+    end: datetime
+    count: int
+    min: Optional[float] = None
+    max: Optional[float] = None
+    mean: Optional[float] = None
+
+
+class RollupResponse(BaseModel):
+    """按事件时间（sent_at）的窗口聚合结果。"""
+
+    model_config = {"populate_by_name": True}
+
+    device_id: str
+    metric: str
+    from_: datetime = Field(alias="from", description="聚合范围起点（含）")
+    to: datetime = Field(description="聚合范围终点（不含）")
+    window_seconds: float
+    allowed_lateness: float
+    watermark: Optional[datetime] = Field(
+        default=None,
+        description="设备已提交数据的最大 sent_at 减 allowed_lateness；无数据时为 null",
+    )
+    late_count: int = Field(
+        description="范围内 sent_at 早于水位的迟到样本数（不改写已关闭窗口）"
+    )
+    windows: List[RollupWindow] = Field(description="按 start 升序的全部窗口")
